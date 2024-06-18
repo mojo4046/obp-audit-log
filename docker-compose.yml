@@ -1,0 +1,529 @@
+networks:
+  default:
+    name: network-chaos
+
+services:
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./data/postgres-data:/var/lib/postgresql/data
+      - ./config/postgresql.conf:/etc/postgresql.conf
+    command: postgres -c config_file=/etc/postgresql.conf
+    healthcheck:
+      test: ['CMD', 'psql', '-U', 'postgres', '-c', 'SELECT 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack
+    container_name: localstack-main      # !IMPORTANT
+    hostname: localstack
+    ports:
+      - "127.0.0.1:4566:4566"            # LocalStack Gateway
+      - "127.0.0.1:4510-4559:4510-4559"  # external services port range
+    environment:
+      # LocalStack configuration: https://docs.localstack.cloud/references/configuration/
+      - DEBUG=${DEBUG:-0}
+      - SERVICES=lambda,s3,sqs,sns,kms,logs,ssm
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=testUser
+      - AWS_SECRET_ACCESS_KEY=testAccessKey      
+    volumes:
+      - "${LOCALSTACK_VOLUME_DIR:-./data/volume}:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+  aws-cli:
+    image: amazon/aws-cli
+    container_name: aws-cli
+    depends_on:
+      - localstack
+    environment:
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=testUser
+      - AWS_SECRET_ACCESS_KEY=testAccessKey      
+    entrypoint: /bin/sh -c
+    command: |
+      "aws --endpoint-url=http://localstack:4566 s3api create-bucket --bucket sync-bucket --region us-east-1"
+
+  zookeeper-01:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper-01
+    container_name: zookeeper-01
+    ports:
+      - '2181:2181'  # Expose client port to the host
+    environment:
+      ZOOKEEPER_SERVER_ID: 1  # Unique ID for this node
+      ZOOKEEPER_CLIENT_PORT: 2181  # Client port for clients to connect
+      ZOOKEEPER_PEER_PORT: 22881  # Peer port for communication between nodes
+      ZOOKEEPER_TICK_TIME: 2000  # Time unit for maintaining leader election
+      ZOOKEEPER_AUTOPURGE_PURGEINTERVAL: 24
+      ZOOKEEPER_AUTOPURGE_SNAPRETAINCOUNT: 3
+      ZOOKEEPER_SERVERS: "zookeeper-01:22881:23881;zookeeper-02:22882:23882;zookeeper-03:22883:23883"  # List of all servers in the ensemble
+    extra_hosts:
+      - "localhost:127.0.0.1"  # Add localhost mapping for container
+    volumes:
+      - ./data/zoo-01:/var/lib/zookeeper  # Persist data
+    healthcheck:
+      test: echo srvr | nc zookeeper-01 2181 || exit 1  # Health check command
+      start_period: 10s
+      retries: 20
+      interval: 10s
+  # ZooKeeper Node 02
+  zookeeper-02:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper-02
+    container_name: zookeeper-02
+    ports:
+      - '2182:2182'
+    environment:
+      ZOOKEEPER_SERVER_ID: 2
+      ZOOKEEPER_CLIENT_PORT: 2182
+      ZOOKEEPER_PEER_PORT: 22882
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_AUTOPURGE_PURGEINTERVAL: 24
+      ZOOKEEPER_AUTOPURGE_SNAPRETAINCOUNT: 3
+      ZOOKEEPER_SERVERS: "zookeeper-01:22881:23881;zookeeper-02:22882:23882;zookeeper-03:22883:23883"
+    extra_hosts:
+      - "localhost:127.0.0.1"
+    volumes:
+      - ./data/zoo-02:/var/lib/zookeeper
+    healthcheck:
+      test: echo srvr | nc zookeeper-02 2182 || exit 1
+      start_period: 10s
+      retries: 20
+      interval: 10s
+  # ZooKeeper Node 03
+  zookeeper-03:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper-03
+    container_name: zookeeper-03
+    ports:
+      - '2183:2183'
+    environment:
+      ZOOKEEPER_SERVER_ID: 3
+      ZOOKEEPER_CLIENT_PORT: 2183
+      ZOOKEEPER_PEER_PORT: 22883
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_AUTOPURGE_PURGEINTERVAL: 24
+      ZOOKEEPER_AUTOPURGE_SNAPRETAINCOUNT: 3
+      ZOOKEEPER_SERVERS: "zookeeper-01:22881:23881;zookeeper-02:22882:23882;zookeeper-03:22883:23883"
+    extra_hosts:
+      - "localhost:127.0.0.1"
+    volumes:
+      - ./data/zoo-03:/var/lib/zookeeper
+    healthcheck:
+      test: echo srvr | nc zookeeper-03 2183 || exit 1
+      start_period: 10s
+      retries: 20
+      interval: 10s
+  broker-01:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: broker-01
+    container_name: broker-01
+    ports:
+      - '29092:29092'
+      - '9092:9092'
+      - '9101:9101'
+    depends_on:
+      zookeeper-01:
+        condition: service_healthy
+      zookeeper-02:
+        condition: service_healthy
+      zookeeper-03:
+        condition: service_healthy
+    environment:
+      # Kafka broker configuration
+      KAFKA_BROKER_ID: 1  # Unique ID for this broker
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183  # ZooKeeper connection string
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT  # Listener security protocols
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-01:29092,PLAINTEXT_HOST://localhost:9092  # Advertised listeners for clients
+      KAFKA_LISTENERS: 'PLAINTEXT://broker-01:29092,PLAINTEXT_HOST://0.0.0.0:9092'  # Listeners for Kafka broker
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2  # Replication factor for __consumer_offsets topic
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2  # Minimum ISR for transaction state log topic
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2  # Replication factor for transaction state log topic
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # Initial delay for group rebalancing
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'  # Automatic topic creation enabled/disabled
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_JMX_PORT: 9101  # JMX monitoring port
+      KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=broker-01 -Dcom.sun.management.jmxremote.rmi.port=9101  # JMX options for monitoring
+    volumes:
+      - ./data/broker-01:/var/lib/kafka
+    healthcheck:
+      test: nc -z localhost 9092 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10 
+  broker-02:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: broker-02
+    container_name: broker-02
+    ports:
+      - '29093:29093'
+      - '9093:9093'
+#      - '9102:9102'
+    depends_on:
+      zookeeper-01:
+        condition: service_healthy
+      zookeeper-02:
+        condition: service_healthy
+      zookeeper-03:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-02:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENERS: 'PLAINTEXT://broker-02:29093,PLAINTEXT_HOST://0.0.0.0:9093'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2  # Replication factor for __consumer_offsets topic
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2  # Minimum ISR for transaction state log topic
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2  # Replication factor for transaction state log topic
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # Initial delay for group rebalancing
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'  # Automatic topic creation enabled/disabled
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=broker-02 -Dcom.sun.management.jmxremote.rmi.port=9101
+    volumes:
+      - ./data/broker-02:/var/lib/kafka
+    healthcheck:
+      test: nc -z localhost 9093 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+  broker-03:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: broker-03
+    container_name: broker-03
+    ports:
+      - '29094:29094'
+      - '9094:9094'
+    depends_on:
+      zookeeper-01:
+        condition: service_healthy
+      zookeeper-02:
+        condition: service_healthy
+      zookeeper-03:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 3
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-03:29094,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENERS: 'PLAINTEXT://broker-03:29094,PLAINTEXT_HOST://0.0.0.0:9094'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2  # Replication factor for __consumer_offsets topic
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2  # Minimum ISR for transaction state log topic
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2  # Replication factor for transaction state log topic
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # Initial delay for group rebalancing
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'  # Automatic topic creation enabled/disabled
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=broker-03 -Dcom.sun.management.jmxremote.rmi.port=9101
+    volumes:
+      - ./data/broker-03:/var/lib/kafka
+    healthcheck:
+      test: nc -z localhost 9094 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+  connect-01:
+    image: confluentinc/cp-kafka-connect:7.5.0
+    hostname: connect-01
+    container_name: connect-01
+    restart: always
+    depends_on:
+      broker-01:
+        condition: service_healthy    
+      broker-02:
+        condition: service_healthy    
+      broker-03:
+        condition: service_healthy    
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect-01
+      CONNECT_BOOTSTRAP_SERVERS: 'broker-01:29092,broker-02:29093,broker-03:29094'
+      CONNECT_GROUP_ID: connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
+      CONNECT_STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_ZOOKEEPER_CONNECT: 'zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183'
+      CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/"
+    volumes:
+      - ./connect-plugins:/usr/share/kafka/plugins/
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'curl',
+          '--silent',
+          '--fail',
+          '-X',
+          'GET',
+          'http://localhost:8083/connectors',
+        ]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  connect-02:
+    image: confluentinc/cp-kafka-connect:7.5.0
+    hostname: connect-02
+    container_name: connect-02
+    restart: always
+    depends_on:
+      broker-01:
+        condition: service_healthy    
+      broker-02:
+        condition: service_healthy    
+      broker-03:
+        condition: service_healthy    
+    ports:
+      - "8084:8083"
+    environment:
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect-02
+      CONNECT_BOOTSTRAP_SERVERS: 'broker-01:29092,broker-02:29093,broker-03:29094'
+      CONNECT_GROUP_ID: connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
+      CONNECT_STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_ZOOKEEPER_CONNECT: 'zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183'
+      CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/"
+    volumes:
+      - ./connect-plugins:/usr/share/kafka/plugins/
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'curl',
+          '--silent',
+          '--fail',
+          '-X',
+          'GET',
+          'http://localhost:8084/connectors',
+        ]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  connect-03:
+    image: confluentinc/cp-kafka-connect:7.5.0
+    hostname: connect-03
+    container_name: connect-03
+    restart: always
+    depends_on:
+      broker-01:
+        condition: service_healthy    
+      broker-02:
+        condition: service_healthy    
+      broker-03:
+        condition: service_healthy    
+    ports:
+      - "8085:8083"
+    environment:
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect-03
+      CONNECT_BOOTSTRAP_SERVERS: 'broker-01:29092,broker-02:29093,broker-03:29094'
+      CONNECT_GROUP_ID: connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
+      CONNECT_STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_ZOOKEEPER_CONNECT: 'zookeeper-01:2181,zookeeper-02:2182,zookeeper-03:2183'
+      CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/"
+    volumes:
+      - ./connect-plugins:/usr/share/kafka/plugins/
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'curl',
+          '--silent',
+          '--fail',
+          '-X',
+          'GET',
+          'http://localhost:8084/connectors',
+        ]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      broker-01:
+        condition: service_healthy    
+      broker-02:
+        condition: service_healthy    
+      broker-03:
+        condition: service_healthy    
+    ports:
+      - '8081:8081'
+    environment:      
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry # Host name for the Schema Registry service.      
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker-01:29092,broker-02:29093,broker-03:29094 # Comma-separated list of Kafka bootstrap servers for the Schema Registry to connect to.      
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081 # Listeners for the Schema Registry to bind to. Accepts incoming HTTP connections.
+      SCHEMA_REGISTRY_GROUP_ID: schema-registry-group # Kafka consumer group ID used by the Schema Registry to track schema compatibility.
+      SCHEMA_REGISTRY_ACCESS_CONTROL_ALLOW_METHODS: GET,POST,PUT,DELETE # Allowed HTTP methods for Schema Registry requests. Comma-separated list.
+    healthcheck:
+      start_period: 10s
+      interval: 10s
+      retries: 20
+      test: curl --user superUser:superUser --fail --silent --insecure http://localhost:8081/subjects --output /dev/null || exit 1
+      
+  ksqldb-server-01:
+    image: confluentinc/cp-ksqldb-server:7.5.0
+    hostname: ksqldb-server
+    container_name: ksqldb-server-01
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+      - schema-registry
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./connect-plugins/:/usr/share/kafka/plugins/
+      - ./extensions/:/opt/ksqldb-udfs
+    environment:        
+      KSQL_LISTENERS: http://0.0.0.0:8088 # Listeners for KSQLDB to bind to, accepting incoming HTTP connections.
+      KSQL_BOOTSTRAP_SERVERS: broker-01:29092,broker-02:29093,broker-03:29094 # Kafka bootstrap servers that KSQLDB should connect to.
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true" # Automatically create processing streams for KSQLDB's logging.
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true" # Automatically create processing topic for KSQLDB's logging.
+      KSQL_CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/" # Path to additional Kafka Connect plugins.
+      KSQL_KSQL_EXTENSION_DIR: "/opt/ksqldb-udfs"
+
+  ksqldb-server-02:
+    image: confluentinc/cp-ksqldb-server:7.5.0
+    hostname: ksqldb-server-02
+    container_name: ksqldb-server-02
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+      - schema-registry
+    ports:
+      - "8089:8088"
+    volumes:
+      - ./connect-plugins/:/usr/share/kafka/plugins/
+      - ./extensions/:/opt/ksqldb-udfs
+    environment:
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_BOOTSTRAP_SERVERS: broker-01:29092,broker-02:29093,broker-03:29094
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+      KSQL_CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/"
+      KSQL_KSQL_EXTENSION_DIR: "/opt/ksqldb-udfs"
+
+  ksqldb-server-03:
+    image: confluentinc/cp-ksqldb-server:7.5.0
+    hostname: ksqldb-server-03
+    container_name: ksqldb-server-03
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+      - schema-registry
+    ports:
+      - "8090:8088"
+    volumes:
+      - ./connect-plugins/:/usr/share/kafka/plugins/
+      - ./extensions/:/opt/ksqldb-udfs
+    environment:
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_BOOTSTRAP_SERVERS: broker-01:29092,broker-02:29093,broker-03:29094
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+      KSQL_CONNECT_PLUGIN_PATH: "/usr/share/kafka/plugins/"
+      KSQL_KSQL_EXTENSION_DIR: "/opt/ksqldb-udfs"
+
+  ksqldb-cli:
+    image: confluentinc/cp-ksqldb-cli:7.5.0
+    container_name: ksqldb-cli
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+      - ksqldb-server-01
+    entrypoint: /bin/sh
+    tty: true
+
+  kafka-rest:
+    image: confluentinc/cp-kafka-rest:7.5.0
+    hostname: kafka-rest
+    container_name: kafka-rest
+    ports:
+    - "8082:8082"
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+    environment:
+      KAFKA_REST_HOST_NAME: kafka-rest
+      KAFKA_REST_BOOTSTRAP_SERVERS: broker-01:29092,broker-02:29093,broker-03:29094
+      KAFKA_REST_LISTENERS: 'http://0.0.0.0:8082'
+  
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - 8080:8080
+    depends_on:
+      - broker-01
+      - broker-02
+      - broker-03
+      - schema-registry
+      - connect-01
+      - connect-02
+      - ksqldb-server-01
+      - ksqldb-server-02
+      - ksqldb-server-03
+    environment:
+      KAFKA_CLUSTERS_0_NAME: Storm
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker-01:29092,broker-02:29093,broker-03:29094
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9101
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect-01
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect-01:8083
+      KAFKA_CLUSTERS_0_KAFKACONNECT_1_NAME: connect-02
+      KAFKA_CLUSTERS_0_KAFKACONNECT_1_ADDRESS: http://connect-02:8083
+      KAFKA_CLUSTERS_0_KAFKACONNECT_2_NAME: connect-03
+      KAFKA_CLUSTERS_0_KAFKACONNECT_2_ADDRESS: http://connect-03:8083
+      DYNAMIC_CONFIG_ENABLED: 'true'
+volumes:
+  db:
+    driver: local
+
